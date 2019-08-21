@@ -19,7 +19,6 @@
 #include <math.h>
 #include <stdint.h>
 #include <time.h>
-#include <sys/select.h>
 
 #if __has_include(<cpuid.h>)
 #include <cpuid.h>
@@ -47,7 +46,7 @@ __get_cpuid (unsigned int __leaf,
 
 typedef enum th_status_t
 {
-    TOMAHAWK_ERROR = 0,
+    TOMAHAWK_NOT_USE = 0,
     TOMAHAWK_USE_RDTSCP,
     TOMAHAWK_USE_RDTSCP_MEAS,
     TOMAHAWK_USE_RDTSC,
@@ -55,16 +54,28 @@ typedef enum th_status_t
     TOMAHAWK_USE_CLOCK_GETTIME,
 } th_status_t;
 
+typedef enum th_error_t
+{
+    TOMAHAWK_NO_ERROR = 0,
+    TOMAHAWK_NOT_USE_ERROR,
+    TOMAHAWK_TIMER_NO_BEGIN_ERROR,
+    TOMAHAWK_TIMER_OVERFLOW_ERROR,
+} th_error_t;
+
 typedef struct th_timer
 {
     uint64_t begin;
     uint64_t end;
-    struct timespec __th_time_begin;
-    struct timespec __th_time_end;
+    struct timespec __clock_begin;
+    struct timespec __clock_end;
 } th_timer;
 
-static th_status_t __th_status = TOMAHAWK_ERROR;
+static th_status_t __th_status = TOMAHAWK_NOT_USE;
 static uint64_t __th_cpu_hz;
+
+#define __NSEC_PER_SEC 1000000000ULL
+#define __USEC_PER_SEC 1000000
+#define __MSEC_PER_SEC 1000
 
 #define __TH_CALIBRATE_TIMES 1000000
 static uint64_t __th_overhead = 0;
@@ -95,7 +106,7 @@ do {                                                      \
                          "mov %%eax, %1\n\t"              \
                        : "=r" (tsc_high), "=r" (tsc_low): \
                        : "%rax", "%rbx", "%rcx", "%rdx"); \
-	(tsc) = ((uint64_t) tsc_high << 32) | tsc_low;        \
+	(tsc) = ((uint64_t) tsc_high << 32U) | tsc_low;       \
 } while (0)
 #define __TH_RDTSCP_END(tsc)                              \
 do {                                                      \
@@ -106,7 +117,7 @@ do {                                                      \
                          "cpuid\n\t"                      \
                        : "=r" (tsc_high), "=r" (tsc_low): \
                        : "%rax", "%rbx", "%rcx", "%rdx"); \
-	(tsc) = ((uint64_t) tsc_high << 32) | tsc_low;        \
+	(tsc) = ((uint64_t) tsc_high << 32U) | tsc_low;       \
 } while (0)
 #define __TH_RDTSC_END(tsc)                               \
 do {                                                      \
@@ -118,7 +129,7 @@ do {                                                      \
                          "mov %%eax, %1\n\t"              \
                        : "=r" (tsc_high), "=r" (tsc_low): \
                        : "%rax", "%rdx");                 \
-	(tsc) = ((uint64_t) tsc_high << 32) | tsc_low;        \
+	(tsc) = ((uint64_t) tsc_high << 32U) | tsc_low;       \
 } while (0)
 
 #else
@@ -131,7 +142,7 @@ do {                                                      \
                          "mov %%eax, %1\n\t"              \
                        : "=r" (tsc_high), "=r" (tsc_low): \
                        : "%eax", "%ebx", "%ecx", "%edx"); \
-	(tsc) = ((uint64_t) tsc_high << 32) | tsc_low;        \
+	(tsc) = ((uint64_t) tsc_high << 32U) | tsc_low;       \
 } while (0)
 #define __TH_RDTSCP_END(tsc)                              \
 do {                                                      \
@@ -142,7 +153,7 @@ do {                                                      \
                          "cpuid\n\t"                      \
                        : "=r" (tsc_high), "=r" (tsc_low): \
                        : "%eax", "%ebx", "%ecx", "%edx"); \
-	(tsc) = ((uint64_t) tsc_high << 32) | tsc_low;        \
+	(tsc) = ((uint64_t) tsc_high << 32U) | tsc_low;       \
 } while (0)
 #define __TH_RDTSC_END(tsc)                               \
 do {                                                      \
@@ -154,7 +165,7 @@ do {                                                      \
                          "mov %%eax, %1\n\t"              \
                        : "=r" (tsc_high), "=r" (tsc_low): \
                        : "%eax", "%edx");                 \
-	(tsc) = ((uint64_t) tsc_high << 32) | tsc_low;        \
+	(tsc) = ((uint64_t) tsc_high << 32U) | tsc_low;       \
 } while (0)
 #endif
 
@@ -200,9 +211,12 @@ static inline uint64_t
 __th_get_cpu_hz_meas(void)
 {
     unsigned int tscBegin, tscEnd, tscTemp;
-    struct timeval sleepTime = {1, 0};
+    int err;
+    struct timespec sleepTime = {1, 0};
     __TH_RDTSC_BEGIN(tscBegin);
-    select(0, NULL, NULL, NULL, &sleepTime);
+    do {
+        err = nanosleep(&sleepTime, &sleepTime);
+    } while (err && (sleepTime.tv_sec > 0 || sleepTime.tv_nsec > 0));
     if (__th_status == TOMAHAWK_USE_RDTSCP_MEAS)
     {
         __TH_RDTSCP_END(tscEnd);
@@ -213,9 +227,11 @@ __th_get_cpu_hz_meas(void)
     }
     tscTemp = tscEnd - tscBegin;
     sleepTime.tv_sec = 2;
-    sleepTime.tv_usec = 0;
+    sleepTime.tv_nsec = 0;
     __TH_RDTSC_BEGIN(tscBegin);
-    select(0, NULL, NULL, NULL, &sleepTime);
+    do {
+        err = nanosleep(&sleepTime, &sleepTime);
+    } while (err && (sleepTime.tv_sec > 0 || sleepTime.tv_nsec > 0));
     if (__th_status == TOMAHAWK_USE_RDTSCP_MEAS)
     {
         __TH_RDTSCP_END(tscEnd);
@@ -233,12 +249,12 @@ __th_set_status(void)
     unsigned int eax, ebx, ecx, edx;
     eax = ebx = ecx = edx = 0;
     /* Determine Invariant TSC available */
-    if (!__get_cpuid(0x80000007, &eax, &ebx, &ecx, &edx) || !(edx & (1 << 8)))
+    if (!__get_cpuid(0x80000007, &eax, &ebx, &ecx, &edx) || !(edx & (1U << 8U)))
     {
         __th_status = TOMAHAWK_USE_CLOCK_GETTIME;
         return;
     }
-    if (!__get_cpuid(0x80000001, &eax, &ebx, &ecx, &edx) || !(edx & (1 << 27)))
+    if (!__get_cpuid(0x80000001, &eax, &ebx, &ecx, &edx) || !(edx & (1U << 27U)))
         __th_status = TOMAHAWK_USE_RDTSC;
     else
         __th_status = TOMAHAWK_USE_RDTSCP;
@@ -251,7 +267,7 @@ __th_set_status(void)
     }
 }
 
-static inline void
+static inline th_error_t
 th_timer_begin(th_timer *timer)
 {
     switch (__th_status)
@@ -263,13 +279,16 @@ th_timer_begin(th_timer *timer)
             __TH_RDTSC_BEGIN(timer->begin);
             break;
         case TOMAHAWK_USE_CLOCK_GETTIME:
-            clock_gettime(CLOCK_MONOTONIC, &timer->__th_time_begin);
+            clock_gettime(CLOCK_MONOTONIC, &timer->__clock_begin);
+            break;
+        case TOMAHAWK_NOT_USE:
         default:
-            return;
+            return TOMAHAWK_NOT_USE_ERROR;
     }
+    return TOMAHAWK_NO_ERROR;
 }
 
-static inline uint64_t
+static inline th_error_t
 th_timer_end(th_timer *timer)
 {
     switch (__th_status)
@@ -283,32 +302,54 @@ th_timer_end(th_timer *timer)
             __TH_RDTSC_END(timer->end);
             break;
         case TOMAHAWK_USE_CLOCK_GETTIME:
-            clock_gettime(CLOCK_MONOTONIC, &timer->__th_time_end);
-            timer->begin = (timer->__th_time_begin.tv_sec * 1000000000ULL + timer->__th_time_begin.tv_nsec) / 1000;
-            timer->end = (timer->__th_time_end.tv_sec * 1000000000ULL + timer->__th_time_end.tv_nsec) / 1000;
-        default:
+            clock_gettime(CLOCK_MONOTONIC, &timer->__clock_end);
+            timer->begin = (timer->__clock_begin).tv_sec * __NSEC_PER_SEC + (timer->__clock_begin).tv_nsec;
+            timer->end = (timer->__clock_end).tv_sec * __NSEC_PER_SEC + (timer->__clock_end).tv_nsec;
             break;
+        case TOMAHAWK_NOT_USE:
+        default:
+            return TOMAHAWK_NOT_USE_ERROR;
     }
-    return timer->begin + __th_overhead < timer->end ? timer->end - timer->begin - __th_overhead : 0;
+    if (timer->begin == 0)
+        return TOMAHAWK_TIMER_NO_BEGIN_ERROR;
+    return (timer->end - __th_overhead > timer->begin) ? TOMAHAWK_NO_ERROR : TOMAHAWK_TIMER_OVERFLOW_ERROR;
 }
 
-static inline double
-th_timer_end_to_us(th_timer *timer)
+static inline th_error_t
+th_timer_end_to_time(th_timer *timer, struct timespec * tp)
 {
-    if (!__th_status)
+    th_error_t end_err = th_timer_end(timer);
+    if (end_err)
+        return end_err;
+
+    uint64_t diff = timer->end - __th_overhead - timer->begin;
+    if (__th_status != TOMAHAWK_USE_CLOCK_GETTIME)
+    {
+        diff = diff * __NSEC_PER_SEC / __th_cpu_hz;
+    }
+    tp->tv_sec = diff / __NSEC_PER_SEC;
+    tp->tv_nsec = (long) (diff - tp->tv_sec * __NSEC_PER_SEC);
+    return TOMAHAWK_NO_ERROR;
+}
+
+static inline uint64_t
+th_timer_end_to_nsec(th_timer *timer)
+{
+    if (th_timer_end(timer))
         return 0;
-    if (__th_status == TOMAHAWK_USE_CLOCK_GETTIME)
-        return (double) th_timer_end(timer);
-    return (double) th_timer_end(timer) * 1000000 / __th_cpu_hz;
+    return timer->end - __th_overhead - timer->begin;
 }
 
 static void
 __th_timer_calibrate(void)
 {
     uint64_t total = 0, diff, results[__TH_CALIBRATE_TIMES];
-    volatile th_timer timer;
-    th_timer_begin(&timer);
-    th_timer_end(&timer);
+    th_timer timer;
+    if (th_timer_begin(&timer) || th_timer_end(&timer))
+    {
+        __th_status = TOMAHAWK_NOT_USE;
+        return;
+    }
     th_timer_begin(&timer);
     th_timer_end(&timer);
     th_timer_begin(&timer);
@@ -316,7 +357,7 @@ __th_timer_calibrate(void)
     for (int i = 0; i < __TH_CALIBRATE_TIMES; i++)
     {
         th_timer_begin(&timer);
-        results[i] = th_timer_end(&timer);
+        results[i] = th_timer_end_to_nsec(&timer);
         total += results[i];
     }
     __th_overhead = total / __TH_CALIBRATE_TIMES;
@@ -335,8 +376,7 @@ __attribute__((constructor)) static void
 __th_timer_constructor(void)
 {
     __th_set_status();
-    if (__th_status)
-        __th_timer_calibrate();
+    __th_timer_calibrate();
 }
 
 static inline th_status_t
