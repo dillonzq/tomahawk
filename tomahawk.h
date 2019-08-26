@@ -17,7 +17,9 @@
 #define _GNU_SOURCE
 
 #include <math.h>
+#include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <time.h>
 
 #if __has_include(<cpuid.h>)
@@ -43,44 +45,6 @@ __get_cpuid (unsigned int __leaf,
     return 1;
 }
 #endif
-
-typedef enum th_status_t
-{
-    TOMAHAWK_NOT_USE = 0,
-    TOMAHAWK_USE_RDTSCP,
-    TOMAHAWK_USE_RDTSCP_MEAS,
-    TOMAHAWK_USE_RDTSC,
-    TOMAHAWK_USE_RDTSC_MEAS,
-    TOMAHAWK_USE_CLOCK_GETTIME,
-} th_status_t;
-
-typedef enum th_error_t
-{
-    TOMAHAWK_NO_ERROR = 0,
-    TOMAHAWK_NOT_USE_ERROR,
-    TOMAHAWK_TIMER_NO_BEGIN_ERROR,
-    TOMAHAWK_TIMER_OVERFLOW_ERROR,
-} th_error_t;
-
-typedef struct th_timer
-{
-    uint64_t begin;
-    uint64_t end;
-    struct timespec __clock_begin;
-    struct timespec __clock_end;
-} th_timer;
-
-static th_status_t __th_status = TOMAHAWK_NOT_USE;
-static uint64_t __th_cpu_hz;
-
-#define __NSEC_PER_SEC 1000000000ULL
-#define __USEC_PER_SEC 1000000
-#define __MSEC_PER_SEC 1000
-
-#define __TH_CALIBRATE_TIMES 1000000
-static uint64_t __th_overhead = 0;
-static double __th_relative_error = 100;
-
 
 /*
  *    These macros are used for benchmark by RDTSC on Intel IA-64 and IA-32
@@ -169,6 +133,228 @@ do {                                                      \
 } while (0)
 #endif
 
+#define __NSEC_PER_SEC 1000000000ULL
+#define __USEC_PER_SEC 1000000
+#define __MSEC_PER_SEC 1000
+
+#define __TH_CALIBRATE_TIMES 1000000
+
+typedef enum th_status_t
+{
+    TOMAHAWK_NOT_USE = 0,
+    TOMAHAWK_USE_RDTSCP,
+    TOMAHAWK_USE_RDTSCP_MEAS,
+    TOMAHAWK_USE_RDTSC,
+    TOMAHAWK_USE_RDTSC_MEAS,
+    TOMAHAWK_USE_CLOCK_GETTIME,
+} th_status_t;
+
+typedef enum th_error_t
+{
+    TOMAHAWK_NO_ERROR = 0,
+    TOMAHAWK_NOT_USE_ERROR,
+    TOMAHAWK_TIMER_NO_BEGIN_ERROR,
+    TOMAHAWK_TIMER_OVERFLOW_ERROR,
+    TOMAHAWK_RECORDER_ALLOC_ERROR,
+    TOMAHAWK_RECORDER_OVERFLOW_ERROR,
+} th_error_t;
+
+typedef struct th_timer
+{
+    uint64_t begin;
+    uint64_t end;
+    struct timespec __clock_begin;
+    struct timespec __clock_end;
+} th_timer;
+
+typedef struct th_recorder
+{
+    uint64_t *data;
+    unsigned cap;
+    unsigned len;
+    uint64_t total;
+    uint64_t average;
+    double error;
+    uint64_t temp;
+} th_recorder;
+
+static th_status_t __th_status = TOMAHAWK_NOT_USE;
+static uint64_t __th_cpu_hz;
+static uint64_t __th_overhead = 0;
+static double __th_relative_error = 100;
+
+static inline th_status_t
+th_status(void)
+{
+    return __th_status;
+}
+
+static inline uint64_t
+th_overhead(void)
+{
+    return __th_overhead;
+}
+
+static inline double
+th_relative_error(void)
+{
+    return __th_relative_error;
+}
+
+static inline th_error_t
+th_timer_begin(th_timer *timer)
+{
+    switch (__th_status)
+    {
+        case TOMAHAWK_USE_RDTSCP:
+        case TOMAHAWK_USE_RDTSCP_MEAS:
+        case TOMAHAWK_USE_RDTSC:
+        case TOMAHAWK_USE_RDTSC_MEAS:
+            __TH_RDTSC_BEGIN(timer->begin);
+            break;
+        case TOMAHAWK_USE_CLOCK_GETTIME:
+            clock_gettime(CLOCK_MONOTONIC, &timer->__clock_begin);
+            break;
+        case TOMAHAWK_NOT_USE:
+        default:
+            return TOMAHAWK_NOT_USE_ERROR;
+    }
+    return TOMAHAWK_NO_ERROR;
+}
+
+static inline th_error_t
+th_timer_end(th_timer *timer)
+{
+    switch (__th_status)
+    {
+        case TOMAHAWK_USE_RDTSCP:
+        case TOMAHAWK_USE_RDTSCP_MEAS:
+            __TH_RDTSCP_END(timer->end);
+            break;
+        case TOMAHAWK_USE_RDTSC:
+        case TOMAHAWK_USE_RDTSC_MEAS:
+            __TH_RDTSC_END(timer->end);
+            break;
+        case TOMAHAWK_USE_CLOCK_GETTIME:
+            clock_gettime(CLOCK_MONOTONIC, &timer->__clock_end);
+            timer->begin = (timer->__clock_begin).tv_sec * __NSEC_PER_SEC + (timer->__clock_begin).tv_nsec;
+            timer->end = (timer->__clock_end).tv_sec * __NSEC_PER_SEC + (timer->__clock_end).tv_nsec;
+            break;
+        case TOMAHAWK_NOT_USE:
+        default:
+            return TOMAHAWK_NOT_USE_ERROR;
+    }
+    if (timer->begin == 0)
+        return TOMAHAWK_TIMER_NO_BEGIN_ERROR;
+    return (timer->end - __th_overhead > timer->begin) ? TOMAHAWK_NO_ERROR : TOMAHAWK_TIMER_OVERFLOW_ERROR;
+}
+
+static inline th_error_t
+th_timer_end_to_nsec(th_timer *timer, uint64_t *nsec)
+{
+    th_error_t end_err = th_timer_end(timer);
+    if (end_err)
+        return end_err;
+
+    *nsec = timer->end - __th_overhead - timer->begin;
+
+    if (__th_status != TOMAHAWK_USE_CLOCK_GETTIME)
+    {
+        *nsec = *nsec * __NSEC_PER_SEC / __th_cpu_hz;
+    }
+    return TOMAHAWK_NO_ERROR;
+}
+
+static inline th_error_t
+th_timer_end_to_time(th_timer *timer, struct timespec * tp)
+{
+    uint64_t nsec;
+
+    th_error_t end_err = th_timer_end_to_nsec(timer, &nsec);
+    if (end_err)
+        return end_err;
+
+    tp->tv_sec = nsec / __NSEC_PER_SEC;
+    tp->tv_nsec = (long) (nsec - tp->tv_sec * __NSEC_PER_SEC);
+    return TOMAHAWK_NO_ERROR;
+}
+
+static inline th_error_t
+th_timer_end_to_recorder(th_timer *timer, th_recorder *rcd)
+{
+    th_error_t end_err = th_timer_end(timer);
+    if (end_err)
+        return end_err;
+    rcd->temp = timer->end - __th_overhead - timer->begin;
+
+    if (rcd->len == 0)
+    {
+        if (rcd->cap == 0)
+            rcd->cap = 64;
+        free(rcd->data);
+        rcd->data = (uint64_t *)malloc(sizeof(uint64_t) * rcd->cap);
+        if (rcd->data == NULL)
+            return TOMAHAWK_RECORDER_ALLOC_ERROR;
+        rcd->total = 0;
+    }
+    if (UINT64_MAX - rcd->total < rcd->temp)
+        return TOMAHAWK_RECORDER_OVERFLOW_ERROR;
+    if (rcd->len >= rcd->cap)
+    {
+        uint64_t *ptr = (uint64_t *)realloc(rcd->data, rcd->cap * 2);
+        if (ptr == NULL)
+            return TOMAHAWK_RECORDER_ALLOC_ERROR;
+        rcd->data = ptr;
+        rcd->cap *= 2;
+    }
+    rcd->data[(rcd->len)++] = rcd->temp;
+    rcd->total += rcd->temp;
+    return TOMAHAWK_NO_ERROR;
+}
+
+static inline void
+th_free_recorder(th_recorder *rcd)
+{
+    if (rcd == NULL)
+        return;
+    free(rcd->data);
+    rcd->data = NULL;
+    rcd->len = 0;
+}
+
+static inline void
+__th_arr_calculate(uint64_t *arr, unsigned len, uint64_t total, uint64_t *average, double *error)
+{
+    uint64_t __average, diff;
+
+    if (len == 0 || total == 0)
+        return;
+    __average = total / len;
+    if (average != NULL)
+        *average = __average;
+    if (__average == 0 || error == NULL)
+        return;
+    total = 0;
+    for (int i = 0; i < len; i++)
+    {
+        diff = arr[i] > __average ? arr[i] - __average :
+                                    __average - arr[i];
+        total += diff * diff;
+    }
+    *error = sqrt((double) total / (len - 1)) / __average;
+}
+
+static inline unsigned
+th_flush_recorder(th_recorder *rcd)
+{
+    if (rcd == NULL || rcd->data == NULL)
+        return 0;
+
+    unsigned len = rcd->len;
+    __th_arr_calculate(rcd->data, rcd->len, rcd->total, &(rcd->average), &(rcd->error));
+    th_free_recorder(rcd);
+    return len;
+}
 
 /*
  * get_tsc_khz_cpuid
@@ -254,6 +440,7 @@ __th_set_status(void)
         __th_status = TOMAHAWK_USE_CLOCK_GETTIME;
         return;
     }
+    /* Determine RDTSCP instruction available */
     if (!__get_cpuid(0x80000001, &eax, &ebx, &ecx, &edx) || !(edx & (1U << 27U)))
         __th_status = TOMAHAWK_USE_RDTSC;
     else
@@ -267,83 +454,10 @@ __th_set_status(void)
     }
 }
 
-static inline th_error_t
-th_timer_begin(th_timer *timer)
-{
-    switch (__th_status)
-    {
-        case TOMAHAWK_USE_RDTSCP:
-        case TOMAHAWK_USE_RDTSCP_MEAS:
-        case TOMAHAWK_USE_RDTSC:
-        case TOMAHAWK_USE_RDTSC_MEAS:
-            __TH_RDTSC_BEGIN(timer->begin);
-            break;
-        case TOMAHAWK_USE_CLOCK_GETTIME:
-            clock_gettime(CLOCK_MONOTONIC, &timer->__clock_begin);
-            break;
-        case TOMAHAWK_NOT_USE:
-        default:
-            return TOMAHAWK_NOT_USE_ERROR;
-    }
-    return TOMAHAWK_NO_ERROR;
-}
-
-static inline th_error_t
-th_timer_end(th_timer *timer)
-{
-    switch (__th_status)
-    {
-        case TOMAHAWK_USE_RDTSCP:
-        case TOMAHAWK_USE_RDTSCP_MEAS:
-            __TH_RDTSCP_END(timer->end);
-            break;
-        case TOMAHAWK_USE_RDTSC:
-        case TOMAHAWK_USE_RDTSC_MEAS:
-            __TH_RDTSC_END(timer->end);
-            break;
-        case TOMAHAWK_USE_CLOCK_GETTIME:
-            clock_gettime(CLOCK_MONOTONIC, &timer->__clock_end);
-            timer->begin = (timer->__clock_begin).tv_sec * __NSEC_PER_SEC + (timer->__clock_begin).tv_nsec;
-            timer->end = (timer->__clock_end).tv_sec * __NSEC_PER_SEC + (timer->__clock_end).tv_nsec;
-            break;
-        case TOMAHAWK_NOT_USE:
-        default:
-            return TOMAHAWK_NOT_USE_ERROR;
-    }
-    if (timer->begin == 0)
-        return TOMAHAWK_TIMER_NO_BEGIN_ERROR;
-    return (timer->end - __th_overhead > timer->begin) ? TOMAHAWK_NO_ERROR : TOMAHAWK_TIMER_OVERFLOW_ERROR;
-}
-
-static inline th_error_t
-th_timer_end_to_time(th_timer *timer, struct timespec * tp)
-{
-    th_error_t end_err = th_timer_end(timer);
-    if (end_err)
-        return end_err;
-
-    uint64_t diff = timer->end - __th_overhead - timer->begin;
-    if (__th_status != TOMAHAWK_USE_CLOCK_GETTIME)
-    {
-        diff = diff * __NSEC_PER_SEC / __th_cpu_hz;
-    }
-    tp->tv_sec = diff / __NSEC_PER_SEC;
-    tp->tv_nsec = (long) (diff - tp->tv_sec * __NSEC_PER_SEC);
-    return TOMAHAWK_NO_ERROR;
-}
-
-static inline uint64_t
-th_timer_end_to_nsec(th_timer *timer)
-{
-    if (th_timer_end(timer))
-        return 0;
-    return timer->end - __th_overhead - timer->begin;
-}
-
-static void
+static inline void
 __th_timer_calibrate(void)
 {
-    uint64_t total = 0, diff, results[__TH_CALIBRATE_TIMES];
+    uint64_t results[__TH_CALIBRATE_TIMES], total = 0;
     th_timer timer;
     if (th_timer_begin(&timer) || th_timer_end(&timer))
     {
@@ -357,44 +471,17 @@ __th_timer_calibrate(void)
     for (int i = 0; i < __TH_CALIBRATE_TIMES; i++)
     {
         th_timer_begin(&timer);
-        results[i] = th_timer_end_to_nsec(&timer);
+        th_timer_end_to_nsec(&timer, &(results[i]));
         total += results[i];
     }
-    __th_overhead = total / __TH_CALIBRATE_TIMES;
-    total = 0;
-    for (int i = 0; i < __TH_CALIBRATE_TIMES; i++)
-    {
-        diff = results[i] > __th_overhead ? results[i] - __th_overhead :
-                                            __th_overhead - results[i];
-        total += diff * diff;
-    }
-    __th_relative_error = sqrt((double) total / (__TH_CALIBRATE_TIMES - 1)) / __th_overhead;
+    __th_arr_calculate(results, __TH_CALIBRATE_TIMES, total, &__th_overhead, &__th_relative_error);
 }
-
 
 __attribute__((constructor)) static void
 __th_timer_constructor(void)
 {
     __th_set_status();
     __th_timer_calibrate();
-}
-
-static inline th_status_t
-th_status(void)
-{
-    return __th_status;
-}
-
-static inline uint64_t
-th_overhead(void)
-{
-    return __th_overhead;
-}
-
-static inline double
-th_relative_error(void)
-{
-    return __th_relative_error;
 }
 
 #endif /* TOMAHAWK_H */
